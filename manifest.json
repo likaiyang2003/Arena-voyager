@@ -1,0 +1,26 @@
+{
+    "manifest_version": 3,
+    "name": "LMArena 导航助手",
+    "version": "1.2.0",
+    "description": "为 LMArena 提供目录导航、资料库、提示词库和导出工具。",
+    "permissions": ["storage"],
+    "content_scripts": [
+        {
+            "matches": [
+                "https://arena.ai/*",
+                "https://*.arena.ai/*",
+                "https://lmarena.ai/*",
+                "https://*.lmarena.ai/*",
+                "https://chat.lmsys.org/*"
+            ],
+            "js": [
+                "modules/core.js",
+                "modules/storage.js",
+                "modules/lmarena.js",
+                "content.js"
+            ],
+            "css": ["style.css"],
+            "run_at": "document_idle"
+        }
+    ]
+}
