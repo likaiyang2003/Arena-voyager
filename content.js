@@ -47,10 +47,11 @@
         chevronLeft: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18 9 12l6-6"></path></svg>',
         chevronRight: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"></path></svg>',
         outlineUser: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>',
-        outlineHeading: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 12h10"></path><circle cx="5" cy="12" r="1.5" fill="currentColor" stroke="none"></circle></svg>'
+        outlineHeading: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 12h10"></path></svg>'
     };
 
     const THEMES = [ 'auto', 'light', 'dark' ];
+    const GLOBAL_SEARCH_PLACEHOLDER = '全局搜索文件夹、会话、提示词';
     const SEARCH_PLACEHOLDERS = {
         outline: '搜索当前对话大纲',
         prompts: '搜索提示词',
@@ -62,8 +63,11 @@
     const LIBRARY_INBOX_ID = '__inbox__';
     const DEFAULT_FOLDER_COLOR = '#8ab4f8';
     const FOLDER_COLOR_PRESETS = [ '#ef4444', '#f59e0b', '#10b981', '#3b82f6', '#a855f7' ];
-    const OUTLINE_BLACKLIST_CLASS_RE = /(code|mermaid|highlight|md-code)/i;
     const OUTLINE_AI_GROUPS_EXPANDED_BY_DEFAULT = true;
+    const FLOATING_UI_SELECTOR = '#lmarena-map-sidebar, #lmnav-outline-panel, #lmarena-hover-tooltip, #lmnav-toast';
+    const SIDEBAR_INTERNAL_SELECTOR = '#lmarena-map-sidebar-mount, ' + FLOATING_UI_SELECTOR;
+    const OUTLINE_CONTENT_SELECTOR = '.bg-surface-raised, .prose';
+    const OUTLINE_HEADING_SELECTOR = 'h1, h2, h3, h4, h5, h6';
     const collapsedGroups = new Set();
     const SIDEBAR_PRIMARY_NAV_RE = /(New Chat|Leaderboard|Search|新对话|排行榜|搜索)/i;
     const SIDEBAR_HISTORY_SECTION_RE = /(Older|Today|Yesterday|Archive|History|Earlier|历史|更早|今天|昨天|归档)/i;
@@ -82,7 +86,8 @@
         isVisible: true,
         width: 236,
         layoutMode: 'floating',
-        searchTerm: '',
+        globalSearchTerm: '',
+        outlineSearchTerm: '',
         prompts: [],
         savedConversations: [],
         savedFolders: [],
@@ -93,6 +98,10 @@
         tooltipEl: null,
         globalTooltipEl: null,
         toastEl: null,
+        toastTextEl: null,
+        toastUndoButtonEl: null,
+        toastUndoCallback: null,
+        toastExpireCallback: null,
         outlinePanelEl: null,
         showFolderSettings: false,
         activeFolderMenuId: null,
@@ -404,6 +413,80 @@
         ]);
     }
 
+    function cloneSerializable(value) {
+        if (typeof structuredClone === 'function') {
+            return structuredClone(value);
+        }
+
+        return JSON.parse(JSON.stringify(value));
+    }
+
+    function createLibraryStateSnapshot() {
+        return cloneSerializable({
+            savedConversations: state.savedConversations,
+            savedFolders: state.savedFolders,
+            collapsedFolderIds: state.collapsedFolderIds,
+            currentLibraryFolderId: state.currentLibraryFolderId,
+            lastSaveFolder: state.lastSaveFolder
+        });
+    }
+
+    function restoreLibraryStateSnapshot(snapshot) {
+        if (!snapshot) {
+            return;
+        }
+
+        state.savedConversations = Array.isArray(snapshot.savedConversations)
+            ? snapshot.savedConversations.map(normalizeSavedConversation).filter(Boolean)
+            : [];
+        state.savedFolders = Array.isArray(snapshot.savedFolders)
+            ? snapshot.savedFolders.map(normalizeFolderItem).filter(Boolean)
+            : [];
+        state.collapsedFolderIds = Array.isArray(snapshot.collapsedFolderIds)
+            ? snapshot.collapsedFolderIds.map(String)
+            : [];
+        state.currentLibraryFolderId = typeof snapshot.currentLibraryFolderId === 'string'
+            ? snapshot.currentLibraryFolderId
+            : LIBRARY_ALL_ID;
+        state.lastSaveFolder = typeof snapshot.lastSaveFolder === 'string'
+            ? snapshot.lastSaveFolder
+            : '';
+
+        ensureLibraryState();
+        updateSaveFolderInputValue(state.lastSaveFolder);
+        closeFolderContextMenu();
+        clearFolderEditState();
+        renderLibrary();
+        renderTools();
+        if (state.globalSearchTerm) {
+            renderGlobalSearchResults();
+        }
+    }
+
+    function createPromptStateSnapshot() {
+        return cloneSerializable({
+            prompts: state.prompts,
+            outlinePromptDraft: state.outlinePromptDraft
+        });
+    }
+
+    function restorePromptStateSnapshot(snapshot) {
+        if (!snapshot) {
+            return;
+        }
+
+        state.prompts = Array.isArray(snapshot.prompts)
+            ? snapshot.prompts.map(normalizePromptItem).filter(Boolean)
+            : [];
+        state.outlinePromptDraft = snapshot.outlinePromptDraft
+            ? cloneSerializable(snapshot.outlinePromptDraft)
+            : null;
+
+        renderPrompts();
+        renderOutlinePanelV2();
+        renderTools();
+    }
+
     function isFolderExpanded(folderId) {
         return !state.collapsedFolderIds.includes(folderId);
     }
@@ -593,7 +676,7 @@
             return false;
         }
 
-        if (anchor.closest('#lmarena-map-sidebar, #lmnav-outline-panel, #lmarena-hover-tooltip, #lmnav-toast')) {
+        if (matchesClosest(anchor, FLOATING_UI_SELECTOR)) {
             return false;
         }
 
@@ -1039,6 +1122,13 @@
         }
     }
 
+    function updateMainSearchInputValue(value) {
+        const input = document.getElementById('map-search-input');
+        if (input) {
+            input.value = value || '';
+        }
+    }
+
     function revertFolderSelectionAfterEdit(session) {
         if (!session) {
             return;
@@ -1241,13 +1331,6 @@
             items = items.filter((entry) => entry.folderId === state.currentLibraryFolderId);
         }
 
-        if (state.searchTerm) {
-            items = items.filter((entry) => {
-                const haystack = [ entry.title, entry.summary, entry.folder ].join(' ').toLowerCase();
-                return haystack.includes(state.searchTerm);
-            });
-        }
-
         return items;
     }
 
@@ -1427,6 +1510,19 @@
         }
     }
 
+    function syncGlobalSearchModeState() {
+        const sidebar = getSidebar();
+        if (!sidebar) {
+            return;
+        }
+
+        sidebar.classList.toggle('has-global-search', Boolean(state.globalSearchTerm));
+    }
+
+    function matchesClosest(element, selector) {
+        return Boolean(element && element.closest && element.closest(selector));
+    }
+
     function normalizeOutlineText(value) {
         return String(value || '').replace(/\s+/g, ' ').trim();
     }
@@ -1460,20 +1556,42 @@
             return;
         }
 
+        const viewportPadding = 12;
+        const tooltipGap = 12;
+        const maxTooltipWidth = Math.min(560, Math.max(260, window.innerWidth - (viewportPadding * 2)));
+
         tooltip.innerText = safeTooltip;
+        tooltip.style.maxWidth = maxTooltipWidth + 'px';
         tooltip.classList.add('show');
         tooltip.style.left = '-9999px';
         tooltip.style.top = '-9999px';
 
         const rect = item.getBoundingClientRect();
-        const isRightSidebar = rect.left > window.innerWidth / 2;
+        const rightPanel = item.closest('#lmnav-outline-panel');
+        const leftSidebar = item.closest('#lmarena-map-sidebar');
+        const anchorRect = rightPanel instanceof HTMLElement
+            ? rightPanel.getBoundingClientRect()
+            : leftSidebar instanceof HTMLElement
+                ? leftSidebar.getBoundingClientRect()
+                : rect;
         const tooltipWidth = tooltip.offsetWidth;
         const tooltipHeight = tooltip.offsetHeight;
-        const viewportPadding = 12;
+        const spaceLeft = anchorRect.left - viewportPadding - tooltipGap;
+        const spaceRight = window.innerWidth - anchorRect.right - viewportPadding - tooltipGap;
+        const preferLeft = rightPanel instanceof HTMLElement
+            ? true
+            : leftSidebar instanceof HTMLElement
+                ? false
+                : spaceLeft >= spaceRight;
+        const canFitLeft = tooltipWidth <= spaceLeft;
+        const canFitRight = tooltipWidth <= spaceRight;
 
-        let left = isRightSidebar
-            ? rect.left - tooltipWidth - 12
-            : rect.right + 12;
+        let left;
+        if ((preferLeft && canFitLeft) || (!canFitRight && spaceLeft >= spaceRight)) {
+            left = anchorRect.left - tooltipWidth - tooltipGap;
+        } else {
+            left = anchorRect.right + tooltipGap;
+        }
         let top = rect.top + (rect.height / 2) - (tooltipHeight / 2);
 
         left = Math.max(viewportPadding, Math.min(left, window.innerWidth - tooltipWidth - viewportPadding));
@@ -1488,6 +1606,64 @@
         if (tooltip) {
             tooltip.classList.remove('show');
         }
+    }
+
+    function getTooltipTextTargets(item) {
+        if (!(item instanceof HTMLElement)) {
+            return [];
+        }
+
+        const selector = [
+            '.lmnav-outline-text',
+            '.folder-node-name',
+            '.lmnav-tree-title',
+            '.global-search-title',
+            '.global-search-preview',
+            '.global-search-meta'
+        ].join(', ');
+
+        const targets = Array.from(item.querySelectorAll(selector)).filter((node) =>
+            node instanceof HTMLElement && node.isConnected,
+        );
+
+        return targets.length ? targets : [ item ];
+    }
+
+    function isTooltipTextTargetOverflowing(node) {
+        if (!(node instanceof HTMLElement)) {
+            return false;
+        }
+
+        return node.scrollWidth > node.clientWidth + 1 || node.scrollHeight > node.clientHeight + 1;
+    }
+
+    function getRenderedTooltipReferenceText(item) {
+        return getTooltipTextTargets(item)
+            .map((node) => normalizeOutlineText(node.innerText || node.textContent || ''))
+            .filter(Boolean)
+            .join(' ');
+    }
+
+    function shouldShowGlobalTooltip(item, tooltipText) {
+        if (!(item instanceof HTMLElement) || !tooltipText) {
+            return false;
+        }
+
+        const overflowing = getTooltipTextTargets(item).some(isTooltipTextTargetOverflowing);
+        if (overflowing) {
+            return true;
+        }
+
+        const renderedText = getRenderedTooltipReferenceText(item);
+        if (!renderedText) {
+            return tooltipText.length > 12;
+        }
+
+        if (tooltipText === renderedText) {
+            return false;
+        }
+
+        return tooltipText.length > renderedText.length + 4;
     }
 
     function bindGlobalTooltipEvents(item, safeTooltip) {
@@ -1505,6 +1681,10 @@
 
         item.setAttribute('data-tooltip', tooltipText);
         item.onmouseenter = () => {
+            if (!shouldShowGlobalTooltip(item, tooltipText)) {
+                hideGlobalTooltip();
+                return;
+            }
             showGlobalTooltip(item, tooltipText);
         };
         item.onmouseleave = () => {
@@ -1512,294 +1692,90 @@
         };
     }
 
-    function isOutlineBlacklistedElement(element) {
-        if (!element || !(element instanceof HTMLElement)) {
+    function shouldIncludeOutlineContentNode(node) {
+        if (!(node instanceof HTMLElement) || !node.isConnected) {
             return false;
         }
 
-        if ([ 'PRE', 'CODE', 'SVG' ].includes(element.tagName)) {
-            return true;
-        }
-
-        const className = typeof element.className === 'string'
-            ? element.className
-            : (element.getAttribute('class') || '');
-
-        return OUTLINE_BLACKLIST_CLASS_RE.test(className);
-    }
-
-    function hasOutlineBlacklistedAncestor(element) {
-        let current = element instanceof HTMLElement ? element : null;
-        while (current) {
-            if (isOutlineBlacklistedElement(current)) {
-                return true;
-            }
-            current = current.parentElement;
-        }
-
-        return false;
-    }
-
-    function looksLikeOutlineCodeText(text) {
-        const normalized = normalizeOutlineText(text);
-        if (!normalized) {
-            return true;
-        }
-
-        if (/^(```|~~~)/.test(normalized)) {
-            return true;
-        }
-
-        if (/^(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|journey|mindmap|timeline|gitGraph|pie)\b/i.test(normalized)) {
-            return true;
-        }
-
-        if (/(-->|==>|::)/.test(normalized) && /[{}\[\]<>]/.test(normalized)) {
-            return true;
-        }
-
-        const symbolCount = (normalized.match(/[`{}\[\];<>]/g) || []).length;
-        if (symbolCount >= 6 && normalized.length > 24) {
-            return true;
-        }
-
-        return false;
-    }
-
-    function toOutlineLabel(text, fallback) {
-        const normalized = normalizeOutlineText(text);
-        if (!normalized || looksLikeOutlineCodeText(normalized)) {
-            return fallback || '';
-        }
-
-        return core.truncate(normalized, 72);
-    }
-
-    function toOutlineFullText(text, fallback) {
-        const normalized = normalizeOutlineText(text);
-        if (!normalized || looksLikeOutlineCodeText(normalized)) {
-            return fallback || '';
-        }
-
-        return core.truncate(normalized, 240);
-    }
-
-    function stripFencedCodeBlocks(text) {
-        return String(text || '')
-            .replace(/```[\s\S]*?```/g, ' ')
-            .replace(/~~~[\s\S]*?~~~/g, ' ');
-    }
-
-    function getFirstNonEmptyLine(text) {
-        const lines = String(text || '')
-            .replace(/\r/g, '\n')
-            .split('\n')
-            .map((line) => normalizeOutlineText(line))
-            .filter(Boolean);
-
-        return lines[0] || '';
-    }
-
-    function isUsableOutlineHeading(element) {
-        if (!element || !(element instanceof HTMLElement) || !element.isConnected) {
-            return false;
-        }
-
-        if (hasOutlineBlacklistedAncestor(element)) {
-            return false;
-        }
-
-        if (element.closest('#lmarena-map-sidebar, #lmnav-outline-panel, #lmarena-hover-tooltip, #lmnav-toast, nav, aside, header, footer, [role="navigation"], [aria-hidden="true"]')) {
-            return false;
-        }
-
-        const text = normalizeOutlineText(element.textContent);
-        if (!text) {
-            return false;
-        }
-
-        const style = window.getComputedStyle(element);
-        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
-            return false;
-        }
-
-        const rect = element.getBoundingClientRect();
-        if (rect.width < 24 || rect.height < 12) {
-            return false;
+        if (node.classList.contains('prose')) {
+            return !node.closest('.bg-surface-raised');
         }
 
         return true;
     }
 
-    function getUserTOCItem(turn) {
-        const sourceText = stripFencedCodeBlocks(
-            turn?.contentElement?.innerText ||
-            turn?.contentElement?.textContent ||
-            turn?.text ||
-            turn?.element?.innerText ||
-            turn?.element?.textContent ||
-            '',
-        );
-        const firstLine = getFirstNonEmptyLine(sourceText) || normalizeOutlineText(sourceText);
-        const cleanTitle = firstLine || '用户输入';
-        const summary = cleanTitle.length > 20 ? cleanTitle.slice(0, 20) + '...' : cleanTitle;
+    function compareNodesByViewportOrder(left, right) {
+        const rectA = left.getBoundingClientRect();
+        const rectB = right.getBoundingClientRect();
+        return (rectA.top + window.scrollY) - (rectB.top + window.scrollY);
+    }
+
+    function getSortedOutlineContentNodes() {
+        return Array.from(document.querySelectorAll(OUTLINE_CONTENT_SELECTOR))
+            .filter(shouldIncludeOutlineContentNode)
+            .sort(compareNodesByViewportOrder);
+    }
+
+    function createUserTOCItem(node) {
+        const fullText = normalizeOutlineText(node.textContent);
+        if (!fullText) {
+            return null;
+        }
 
         return {
-            id: turn.id,
-            text: '🙋‍♂️ ' + summary,
-            fullText: toOutlineFullText(cleanTitle, '用户输入') || '用户输入',
-            element: turn.element,
+            title: fullText.slice(0, 16) + (fullText.length > 16 ? '...' : ''),
+            fullText: fullText,
             level: 1,
+            element: node,
             source: 'turn'
         };
     }
 
-    function getAssistantHeadingItems(turn) {
-        if (!turn?.element?.isConnected || turn.role !== 'assistant') {
-            return [];
-        }
-
-        const messageScope = turn.contentElement instanceof HTMLElement && turn.contentElement.isConnected
-            ? turn.contentElement
-            : turn.element;
-        if (!(messageScope instanceof HTMLElement) || !messageScope.isConnected) {
-            return [];
-        }
-
-        const seen = new Set();
-        const items = [];
-        messageScope.querySelectorAll('h1, h2, h3, h4, h5, h6, strong').forEach((candidate) => {
-            if (!(candidate instanceof HTMLElement) || !candidate.isConnected) {
+    function appendAssistantHeadingTOCItems(node, toc) {
+        node.querySelectorAll(OUTLINE_HEADING_SELECTOR).forEach((header) => {
+            if (!(header instanceof HTMLElement) || !header.isConnected) {
                 return;
             }
 
-            if (hasOutlineBlacklistedAncestor(candidate)) {
+            const fullText = normalizeOutlineText(header.textContent);
+            if (!fullText) {
                 return;
             }
 
-            const tagName = candidate.tagName.toLowerCase();
-            const rawText = normalizeOutlineText(candidate.innerText || candidate.textContent);
-            if (!rawText || looksLikeOutlineCodeText(rawText)) {
-                return;
-            }
-
-            let targetElement = candidate;
-            let level = 1;
-            if (/^h[1-6]$/.test(tagName)) {
-                level = Number(tagName.slice(1)) || 1;
-            } else {
-                const parent = candidate.closest('p, li, blockquote, div') || candidate.parentElement || candidate;
-                const parentText = normalizeOutlineText(parent?.innerText || parent?.textContent);
-                if (!parentText || parentText !== rawText) {
-                    return;
-                }
-                targetElement = parent;
-                level = 3;
-            }
-
-            if (!messageScope.contains(targetElement)) {
-                return;
-            }
-
-            if (!isUsableOutlineHeading(targetElement)) {
-                return;
-            }
-
-            const text = toOutlineLabel(rawText, '');
-            if (!text) {
-                return;
-            }
-
-            const absoluteTop = Math.round(window.scrollY + targetElement.getBoundingClientRect().top);
-            const key = tagName + '|' + level + '|' + text + '|' + absoluteTop;
-            if (seen.has(key)) {
-                return;
-            }
-
-            seen.add(key);
-            items.push({
-                id: targetElement.id || core.uid('outline'),
-                text: text,
-                fullText: toOutlineFullText(rawText, text) || text,
-                element: targetElement,
-                level: level,
+            const level = parseInt(header.tagName.substring(1), 10);
+            toc.push({
+                title: fullText,
+                fullText: fullText,
+                level: Number.isFinite(level) ? level : 1,
+                element: header,
                 source: 'heading'
             });
         });
+    }
 
-        return items.sort((left, right) =>
-            (window.scrollY + left.element.getBoundingClientRect().top) -
-            (window.scrollY + right.element.getBoundingClientRect().top),
+    function getFilteredOutlineItems(searchTerm) {
+        if (!searchTerm) {
+            return state.outlineItems.slice();
+        }
+
+        return state.outlineItems.filter((item) =>
+            (item.fullText || item.text).toLowerCase().includes(searchTerm),
         );
     }
 
     function generateTOC() {
         const toc = [];
 
-        // --- 必须替换为以下这段精准的节点提取与过滤逻辑 ---
-        let rawNodes = Array.from(document.querySelectorAll('.bg-surface-raised, .prose'));
-
-        let nodeList = rawNodes.filter((node) => {
-            if (!(node instanceof HTMLElement) || !node.isConnected) {
-                return false;
-            }
-
-            if (node.classList.contains('prose')) {
-                // 如果这个 .prose 是包在用户气泡里面的，就忽略它
-                return !node.closest('.bg-surface-raised');
-            }
-            return true;
-        });
-
-        // 保留原有的视觉排序逻辑
-        nodeList.sort((a, b) => {
-            const rectA = a.getBoundingClientRect();
-            const rectB = b.getBoundingClientRect();
-            return (rectA.top + window.scrollY) - (rectB.top + window.scrollY);
-        });
-        // ---------------------------------------------------
-
-        nodeList.forEach((node) => {
-            const isUser = node.classList.contains('bg-surface-raised');
-
-            if (isUser) {
-                const fullText = (node.textContent || '').replace(/\s+/g, ' ').trim();
-                if (!fullText) {
-                    return;
+        getSortedOutlineContentNodes().forEach((node) => {
+            if (node.classList.contains('bg-surface-raised')) {
+                const userItem = createUserTOCItem(node);
+                if (userItem) {
+                    toc.push(userItem);
                 }
-
-                const snippet = fullText.slice(0, 16) + (fullText.length > 16 ? '...' : '');
-                const title = snippet;
-                toc.push({
-                    title: title,
-                    fullText: fullText,
-                    level: 1,
-                    element: node,
-                    source: 'turn'
-                });
                 return;
             }
 
-            const headers = node.querySelectorAll('h1, h2, h3, h4, h5, h6');
-            headers.forEach((header) => {
-                if (!(header instanceof HTMLElement) || !header.isConnected) {
-                    return;
-                }
-
-                const fullText = (header.textContent || '').replace(/\s+/g, ' ').trim();
-                if (!fullText) {
-                    return;
-                }
-
-                const level = parseInt(header.tagName.substring(1), 10);
-                toc.push({
-                    title: '🔸 ' + fullText,
-                    fullText: fullText,
-                    level: Number.isFinite(level) ? level : 1,
-                    element: header,
-                    source: 'heading'
-                });
-            });
+            appendAssistantHeadingTOCItems(node, toc);
         });
 
         return toc.map((item, index) => ({
@@ -2088,7 +2064,7 @@
         return Boolean(
             element &&
             element.closest &&
-            element.closest('#lmarena-map-sidebar-mount, #lmarena-map-sidebar, #lmnav-outline-panel, #lmarena-hover-tooltip, #lmnav-toast'),
+            element.closest(SIDEBAR_INTERNAL_SELECTOR),
         );
     }
 
@@ -2266,6 +2242,9 @@
                 </div>
             </div>
             <div class="map-body-container">
+                <div id="view-search" class="content-view">
+                    <div id="global-search-results" class="scroll-list global-search-results"></div>
+                </div>
                 <div id="view-outline" class="content-view">
                     <div id="map-content" class="scroll-list"></div>
                 </div>
@@ -2347,48 +2326,41 @@
         document.body.appendChild(state.tooltipEl);
         state.toastEl = document.createElement('div');
         state.toastEl.id = 'lmnav-toast';
+        state.toastEl.innerHTML = `
+            <div class="lmnav-toast-content">
+                <span class="lmnav-toast-text" id="lmnav-toast-text"></span>
+                <button class="lmnav-toast-undo" id="lmnav-toast-undo" type="button" hidden>撤销</button>
+            </div>
+        `;
         document.body.appendChild(state.toastEl);
+        state.toastTextEl = state.toastEl.querySelector('#lmnav-toast-text');
+        state.toastUndoButtonEl = state.toastEl.querySelector('#lmnav-toast-undo');
+        state.toastUndoButtonEl?.addEventListener('click', () => {
+            const undoCallback = state.toastUndoCallback;
+            hideToast({ clearOnly: true });
+            if (typeof undoCallback === 'function') {
+                try {
+                    undoCallback();
+                } catch (error) {
+                    console.error(error);
+                }
+            }
+        });
         createOutlinePanelV2();
 
         const searchInput = document.getElementById('map-search-input');
-        searchInput.placeholder = SEARCH_PLACEHOLDERS[state.currentTab];
-        searchInput.disabled = state.currentTab === 'tools';
+        searchInput.placeholder = GLOBAL_SEARCH_PLACEHOLDER;
+        searchInput.disabled = false;
+        searchInput.value = state.globalSearchTerm;
         document.getElementById('save-folder-input').value = state.lastSaveFolder;
 
         applyTheme();
         initResize(sidebar);
         initHoverBehavior(sidebar);
         bindEvents();
+        syncGlobalSearchModeState();
         switchTab(state.layoutMode === 'embedded' ? 'library' : state.currentTab, false);
         syncSidebarVisibilityState();
-    }
-
-    function createOutlinePanel() {
-        if (getOutlinePanel()) {
-            return;
-        }
-
-        const panel = document.createElement('div');
-        panel.id = 'lmnav-outline-panel';
-        panel.innerHTML = `
-            <div class="lmnav-outline-header">
-                <div class="lmnav-outline-title">目录导航</div>
-                <div class="lmnav-outline-actions">
-                    <button class="lmnav-outline-btn" id="btn-outline-refresh" title="刷新目录">${ICONS.refresh}</button>
-                </div>
-            </div>
-            <div class="lmnav-outline-search">
-                <input type="text" id="lmnav-outline-search" placeholder="搜索目录项">
-            </div>
-            <div id="lmnav-outline-list" class="lmnav-outline-list"></div>
-            <div class="lmnav-outline-footer">
-                <button class="lmnav-outline-btn" id="btn-outline-first" title="跳到第一项">${ICONS.arrowUp}</button>
-                <button class="lmnav-outline-btn" id="btn-outline-last" title="跳到最后一项">${ICONS.arrowDown}</button>
-            </div>
-        `;
-
-        document.body.appendChild(panel);
-        state.outlinePanelEl = panel;
     }
 
     function createOutlinePanelV2() {
@@ -2448,17 +2420,45 @@
         state.tooltipEl.addEventListener('mouseleave', startExit);
     }
 
+    function bindLegacyTooltipHover(containerId, hoverHandler) {
+        const container = document.getElementById(containerId);
+        if (!container) {
+            return;
+        }
+
+        container.addEventListener('mouseover', hoverHandler);
+        container.addEventListener('mouseout', hideTooltip);
+    }
+
     function bindEvents() {
         const searchInput = document.getElementById('map-search-input');
         const promptImportInput = document.getElementById('prompt-import-input');
         const floatingToggle = ensureFloatingToggle();
         const debouncedSearch = core.debounce((value) => {
-            state.searchTerm = value.trim().toLowerCase();
+            state.globalSearchTerm = value.trim().toLowerCase();
             renderActiveView();
         }, 180);
 
         searchInput.addEventListener('input', (event) => {
             debouncedSearch(event.target.value || '');
+        });
+        searchInput.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && state.globalSearchTerm) {
+                event.preventDefault();
+                clearGlobalSearch();
+                renderActiveView();
+                return;
+            }
+
+            if (event.key === 'Enter' && state.globalSearchTerm) {
+                const firstResult = document.querySelector('#global-search-results .global-search-item');
+                if (!(firstResult instanceof HTMLElement)) {
+                    return;
+                }
+
+                event.preventDefault();
+                activateGlobalSearchResult(firstResult);
+            }
         });
 
         document.querySelectorAll('.seg-item').forEach((item) => {
@@ -2499,9 +2499,9 @@
         document.getElementById('save-folder-input').addEventListener('input', renderLibraryChrome);
 
         document.getElementById('map-content').addEventListener('click', handleOutlineClick);
+        document.getElementById('global-search-results')?.addEventListener('click', handleGlobalSearchResultClick);
+        document.getElementById('global-search-results')?.addEventListener('keydown', handleGlobalSearchResultKeydown);
         document.getElementById('prompts-list').addEventListener('click', handlePromptClick);
-        document.getElementById('prompts-list').addEventListener('mouseover', handlePromptHover);
-        document.getElementById('prompts-list').addEventListener('mouseout', hideTooltip);
         document.getElementById('library-folder-tree').addEventListener('click', handleFolderTreeClick);
         document.getElementById('library-folder-tree').addEventListener('dragstart', handleLibraryDragStart);
         document.getElementById('library-folder-tree').addEventListener('dragend', handleLibraryDragEnd);
@@ -2509,8 +2509,6 @@
         document.getElementById('library-folder-tree').addEventListener('dragover', handleFolderTreeDragOver);
         document.getElementById('library-folder-tree').addEventListener('dragleave', handleFolderTreeDragLeave);
         document.getElementById('library-folder-tree').addEventListener('drop', handleFolderTreeDrop);
-        document.getElementById('library-folder-tree').addEventListener('mouseover', handleLibraryHover);
-        document.getElementById('library-folder-tree').addEventListener('mouseout', hideTooltip);
         document.getElementById('library-folder-tree').addEventListener('scroll', () => {
             if (state.activeFolderMenuId) {
                 closeFolderContextMenu();
@@ -2520,8 +2518,9 @@
         document.getElementById('library-list').addEventListener('change', handleLibraryChange);
         document.getElementById('library-list').addEventListener('dragstart', handleLibraryDragStart);
         document.getElementById('library-list').addEventListener('dragend', handleLibraryDragEnd);
-        document.getElementById('library-list').addEventListener('mouseover', handleLibraryHover);
-        document.getElementById('library-list').addEventListener('mouseout', hideTooltip);
+        bindLegacyTooltipHover('prompts-list', handlePromptHover);
+        bindLegacyTooltipHover('library-folder-tree', handleLibraryHover);
+        bindLegacyTooltipHover('library-list', handleLibraryHover);
         document.addEventListener('dragstart', handleNativeHistoryDragStart, true);
         document.addEventListener('dragend', handleNativeHistoryDragEnd, true);
 
@@ -2535,7 +2534,7 @@
         document.getElementById('btn-outline-first')?.addEventListener('click', () => jumpToOutlineIndex(0));
         document.getElementById('btn-outline-last')?.addEventListener('click', () => jumpToOutlineIndex(state.outlineItems.length - 1));
         document.getElementById('lmnav-outline-search')?.addEventListener('input', core.debounce((event) => {
-            state.searchTerm = event.target.value.trim().toLowerCase();
+            state.outlineSearchTerm = event.target.value.trim().toLowerCase();
             renderOutlinePanelV2();
         }, 120));
 
@@ -2586,15 +2585,11 @@
         document.querySelectorAll('.content-view').forEach((view) => {
             view.classList.remove('active');
         });
-        document.getElementById('view-' + state.currentTab).classList.add('active');
+        document.getElementById('view-' + (state.globalSearchTerm ? 'search' : state.currentTab))?.classList.add('active');
 
         const searchInput = document.getElementById('map-search-input');
-        searchInput.placeholder = SEARCH_PLACEHOLDERS[state.currentTab];
-        searchInput.disabled = state.currentTab === 'tools';
-        if (state.currentTab === 'tools') {
-            searchInput.value = '';
-            state.searchTerm = '';
-        }
+        searchInput.placeholder = GLOBAL_SEARCH_PLACEHOLDER;
+        searchInput.disabled = false;
 
         renderActiveView();
         if (persist) {
@@ -2603,6 +2598,18 @@
     }
 
     function renderActiveView() {
+        syncGlobalSearchModeState();
+
+        document.querySelectorAll('.content-view').forEach((view) => {
+            view.classList.remove('active');
+        });
+        document.getElementById('view-' + (state.globalSearchTerm ? 'search' : state.currentTab))?.classList.add('active');
+
+        if (state.globalSearchTerm) {
+            renderGlobalSearchResults();
+            return;
+        }
+
         if (state.currentTab === 'outline') {
             renderOutline();
             return;
@@ -2780,7 +2787,7 @@
                 const userItem = createOutlineItemElement(
                     item,
                     variant,
-                    (isPanel ? 'outline-user-item' : 'outline-user-item map-node'),
+                    'outline-user-item',
                 );
                 userItem.dataset.groupKey = groupKey;
 
@@ -2842,9 +2849,7 @@
             return;
         }
 
-        const items = state.searchTerm
-            ? state.outlineItems.filter((item) => (item.fullText || item.text).toLowerCase().includes(state.searchTerm))
-            : state.outlineItems.slice();
+        const items = state.outlineItems.slice();
 
         if (!items.length) {
             container.innerHTML = '<div class="empty-state">当前还没有可展示的用户提问。</div>';
@@ -2854,30 +2859,6 @@
         container.innerHTML = '';
         container.appendChild(buildOutlineTree(items, 'map'));
         updateScrollspy();
-    }
-
-    function renderOutlinePanel() {
-        const panel = getOutlinePanel();
-        const container = document.getElementById('lmnav-outline-list');
-        if (!container || !panel) {
-            return;
-        }
-
-        const items = state.searchTerm
-            ? state.outlineItems.filter((item) => (item.fullText || item.text).toLowerCase().includes(state.searchTerm))
-            : state.outlineItems.slice();
-
-        if (!items.length) {
-            panel.style.display = 'none';
-            container.innerHTML = '<div class="lmnav-outline-empty">当前没有可用的目录项。</div>';
-            return;
-        }
-
-        panel.style.display = 'flex';
-
-        container.innerHTML = '';
-        container.appendChild(buildOutlineTree(items, 'panel'));
-        highlightOutline(getActiveOutlineIndex());
     }
 
     function renderOutlinePanelV2() {
@@ -2920,9 +2901,7 @@
             return;
         }
 
-        const items = state.searchTerm
-            ? state.outlineItems.filter((item) => (item.fullText || item.text).toLowerCase().includes(state.searchTerm))
-            : state.outlineItems.slice();
+        const items = getFilteredOutlineItems(state.outlineSearchTerm);
 
         if (!items.length) {
             tocContainer.innerHTML = '<div class="lmnav-outline-empty">当前没有可用的目录项。</div>';
@@ -2932,6 +2911,225 @@
         tocContainer.innerHTML = '';
         tocContainer.appendChild(buildOutlineTree(items, 'panel'));
         highlightOutline(getActiveOutlineIndex());
+    }
+
+    function buildSearchSnippet(text, query, maxLength) {
+        const normalized = normalizeOutlineText(text);
+        if (!normalized) {
+            return '';
+        }
+
+        const limit = Number(maxLength) || 96;
+        if (!query) {
+            return core.truncate(normalized, limit);
+        }
+
+        const lowerText = normalized.toLowerCase();
+        const index = lowerText.indexOf(query);
+        if (index < 0) {
+            return core.truncate(normalized, limit);
+        }
+
+        const start = Math.max(0, index - Math.floor(limit / 3));
+        const end = Math.min(normalized.length, start + limit);
+        let snippet = normalized.slice(start, end);
+
+        if (start > 0) {
+            snippet = '...' + snippet;
+        }
+        if (end < normalized.length) {
+            snippet += '...';
+        }
+
+        return snippet;
+    }
+
+    function getSearchMatchPriority(primaryText, searchableText, query) {
+        const normalizedQuery = normalizeOutlineText(query).toLowerCase();
+        const primary = normalizeOutlineText(primaryText).toLowerCase();
+        const searchable = normalizeOutlineText(searchableText).toLowerCase();
+
+        if (!normalizedQuery) {
+            return Number.MAX_SAFE_INTEGER;
+        }
+
+        if (primary === normalizedQuery) {
+            return 0;
+        }
+
+        if (primary.startsWith(normalizedQuery)) {
+            return 1;
+        }
+
+        const primaryIndex = primary.indexOf(normalizedQuery);
+        if (primaryIndex >= 0) {
+            return 10 + primaryIndex;
+        }
+
+        const searchableIndex = searchable.indexOf(normalizedQuery);
+        if (searchableIndex >= 0) {
+            return 100 + searchableIndex;
+        }
+
+        return Number.MAX_SAFE_INTEGER;
+    }
+
+    function getGlobalSearchSections() {
+        const query = state.globalSearchTerm;
+        if (!query) {
+            return [];
+        }
+
+        const folders = state.savedFolders
+            .map((folder) => {
+                const path = buildFolderPath(folder.id) || folder.name;
+                const searchableText = [ folder.name, path ].join(' ');
+                const priority = getSearchMatchPriority(folder.name, searchableText, query);
+                if (!Number.isFinite(priority) || priority === Number.MAX_SAFE_INTEGER) {
+                    return null;
+                }
+
+                return {
+                    id: folder.id,
+                    type: 'folder',
+                    title: path,
+                    preview: folder.name !== path ? ('文件夹名：' + folder.name) : ('包含 ' + getFolderEntryCount(folder.id) + ' 条会话'),
+                    meta: (folder.isPinned ? '已置顶 · ' : '') + '左侧资料库',
+                    isPinned: Boolean(folder.isPinned),
+                    scope: 'left',
+                    icon: folder.color ? getFolderNodeIcon(folder.color, false) : ICONS.folder,
+                    fullText: path,
+                    priority: priority
+                };
+            })
+            .filter(Boolean)
+            .sort((left, right) => left.priority - right.priority || Number(right.isPinned) - Number(left.isPinned) || left.title.localeCompare(right.title, 'zh-CN'))
+            .slice(0, 6);
+
+        const conversations = state.savedConversations
+            .map((entry) => {
+                const searchableText = [ entry.title, entry.summary, entry.folder ].join(' ');
+                const priority = getSearchMatchPriority(entry.title, searchableText, query);
+                if (!Number.isFinite(priority) || priority === Number.MAX_SAFE_INTEGER) {
+                    return null;
+                }
+
+                return {
+                    id: entry.id,
+                    type: 'conversation',
+                    title: entry.title,
+                    preview: buildSearchSnippet(entry.summary || entry.title, query, 48),
+                    meta: '左侧会话 · ' + (entry.folder || '未分类') + ' · ' + core.formatTime(entry.savedAt),
+                    scope: 'left',
+                    icon: ICONS.messageSquare,
+                    fullText: [ entry.title, entry.summary, entry.folder ].filter(Boolean).join('\n'),
+                    priority: priority,
+                    sortValue: entry.savedAt
+                };
+            })
+            .filter(Boolean)
+            .sort((left, right) => left.priority - right.priority || right.sortValue - left.sortValue)
+            .slice(0, 10);
+
+        const prompts = state.prompts
+            .map((prompt) => {
+                const searchableText = [ prompt.title, prompt.content, prompt.tags.join(' ') ].join(' ');
+                const priority = getSearchMatchPriority(prompt.title, searchableText, query);
+                if (!Number.isFinite(priority) || priority === Number.MAX_SAFE_INTEGER) {
+                    return null;
+                }
+
+                return {
+                    id: prompt.id,
+                    type: 'prompt',
+                    title: prompt.title,
+                    preview: buildSearchSnippet(prompt.content, query, 48),
+                    meta: '右侧提示词库' + (prompt.tags.length ? (' · ' + prompt.tags.join(' / ')) : ''),
+                    scope: 'right',
+                    icon: ICONS.sparkle,
+                    fullText: [ prompt.title, prompt.content, prompt.tags.join(' ') ].filter(Boolean).join('\n'),
+                    priority: priority,
+                    sortValue: Number.isFinite(prompt.updatedAt) ? prompt.updatedAt : prompt.createdAt
+                };
+            })
+            .filter(Boolean)
+            .sort((left, right) => left.priority - right.priority || right.sortValue - left.sortValue)
+            .slice(0, 8);
+
+        return [
+            { key: 'folders', label: '文件夹', items: folders },
+            { key: 'conversations', label: '会话', items: conversations },
+            { key: 'prompts', label: '提示词', items: prompts }
+        ].filter((section) => section.items.length);
+    }
+
+    function createGlobalSearchResultElement(result) {
+        const row = document.createElement('div');
+        row.className = 'clean-list-item global-search-item';
+        row.dataset.searchType = result.type;
+        row.dataset.resultId = result.id;
+        row.dataset.fullText = result.fullText;
+        row.tabIndex = 0;
+        row.setAttribute('role', 'button');
+        row.innerHTML = `
+            <div class="global-search-item-icon">${result.icon}</div>
+            <div class="item-main global-search-item-main">
+                <div class="global-search-item-topline">
+                    <div class="global-search-title">${core.escapeHtml(result.title)}</div>
+                    <span class="meta-pill global-search-target global-search-target-${result.scope}">${result.scope === 'right' ? '右侧' : '左侧'}</span>
+                </div>
+                <div class="global-search-preview">${core.escapeHtml(result.preview)}</div>
+                <div class="global-search-meta">${core.escapeHtml(result.meta)}</div>
+            </div>
+        `;
+        bindGlobalTooltipEvents(row, result.fullText);
+        return row;
+    }
+
+    function renderGlobalSearchResults() {
+        const container = document.getElementById('global-search-results');
+        if (!container) {
+            return;
+        }
+
+        const sections = getGlobalSearchSections();
+        const total = sections.reduce((sum, section) => sum + section.items.length, 0);
+        if (!total) {
+            container.innerHTML = '<div class="empty-state">没有找到匹配的文件夹、会话或提示词。</div>';
+            return;
+        }
+
+        const fragment = document.createDocumentFragment();
+
+        const summary = document.createElement('div');
+        summary.className = 'global-search-summary';
+        summary.innerHTML = `
+            <div class="global-search-summary-topline">
+                <div class="summary-title">全局搜索结果</div>
+                <span class="meta-pill">${total}</span>
+            </div>
+            <div class="global-search-summary-copy">点击结果后会直接定位到对应侧边栏</div>
+        `;
+        fragment.appendChild(summary);
+
+        sections.forEach((section) => {
+            const sectionEl = document.createElement('section');
+            sectionEl.className = 'global-search-section';
+            sectionEl.innerHTML = `
+                <div class="global-search-section-header">
+                    <div class="global-search-section-title">${section.label}</div>
+                    <span class="meta-pill">${section.items.length}</span>
+                </div>
+            `;
+
+            section.items.forEach((result) => {
+                sectionEl.appendChild(createGlobalSearchResultElement(result));
+            });
+            fragment.appendChild(sectionEl);
+        });
+
+        container.innerHTML = '';
+        container.appendChild(fragment);
     }
 
     function getActiveOutlineIndex() {
@@ -2973,12 +3171,7 @@
             return;
         }
 
-        const items = state.searchTerm
-            ? state.prompts.filter((prompt) => {
-                const haystack = [ prompt.title, prompt.content, prompt.tags.join(' ') ].join(' ').toLowerCase();
-                return haystack.includes(state.searchTerm);
-            })
-            : state.prompts.slice();
+        const items = state.prompts.slice();
 
         if (!items.length) {
             container.innerHTML = '<div class="empty-state">这里还没有提示词，可以把常用指令保存到这里。</div>';
@@ -3012,6 +3205,10 @@
         container.innerHTML = '';
         container.appendChild(fragment);
         syncFolderInlineEditor();
+
+        if (state.globalSearchTerm) {
+            renderGlobalSearchResults();
+        }
     }
 
     function renderLibrary() {
@@ -3021,6 +3218,9 @@
             renderEmbeddedLibraryTree();
             syncFolderInlineEditor();
             renderFloatingFolderMenu();
+            if (state.globalSearchTerm) {
+                renderGlobalSearchResults();
+            }
             return;
         }
 
@@ -3078,6 +3278,10 @@
         container.appendChild(fragment);
         syncFolderInlineEditor();
         renderFloatingFolderMenu();
+
+        if (state.globalSearchTerm) {
+            renderGlobalSearchResults();
+        }
     }
 
     function renderEmbeddedLibraryTree() {
@@ -3341,25 +3545,21 @@
         }
     }
 
-    function handleOutlineHover(event) {
-        const item = event.target.closest('.map-node, .lmnav-outline-item');
-        if (item) {
-            showTooltip(item, item.dataset.fullText || '');
+    function handleDelegatedTooltipHover(event, selector) {
+        const item = event.target.closest(selector);
+        if (!item) {
+            return;
         }
+
+        showTooltip(item, item.dataset.fullText || '');
     }
 
     function handlePromptHover(event) {
-        const item = event.target.closest('.prompt-item');
-        if (item) {
-            showTooltip(item, item.dataset.fullText || '');
-        }
+        handleDelegatedTooltipHover(event, '.prompt-item');
     }
 
     function handleLibraryHover(event) {
-        const item = event.target.closest('.library-item');
-        if (item) {
-            showTooltip(item, item.dataset.fullText || '');
-        }
+        handleDelegatedTooltipHover(event, '.library-item');
     }
 
     function showTooltip(target, text) {
@@ -3564,15 +3764,34 @@
     }
 
     function deletePrompt(promptId) {
-        state.prompts = state.prompts.filter((prompt) => prompt.id !== promptId);
-        persistPromptVault();
-        renderPrompts();
+        const prompt = state.prompts.find((entry) => entry.id === promptId);
+        if (!prompt) {
+            return;
+        }
+
+        const snapshot = createPromptStateSnapshot();
+        state.prompts = state.prompts.filter((entry) => entry.id !== promptId);
         if (state.outlinePromptDraft?.id === promptId) {
             state.outlinePromptDraft = null;
         }
+
+        renderPrompts();
         renderOutlinePanelV2();
         renderTools();
-        showToast('提示词已删除。');
+        showToast(
+            '已删除提示词“' + core.truncate(prompt.title, 24) + '”',
+            () => {
+                restorePromptStateSnapshot(snapshot);
+                persistPromptVault().catch((error) => {
+                    console.error(error);
+                    showToast('撤销删除提示词失败。', true);
+                });
+            },
+            {
+                onExpire: () => persistPromptVault(),
+                actionText: '撤销'
+            },
+        );
     }
 
     function usePrompt(prompt) {
@@ -3582,6 +3801,154 @@
             return;
         }
         showToast('提示词已插入输入框。');
+    }
+
+    function findElementByDataset(selector, datasetKey, value) {
+        return Array.from(document.querySelectorAll(selector)).find((element) =>
+            element instanceof HTMLElement && element.dataset && element.dataset[datasetKey] === String(value),
+        ) || null;
+    }
+
+    function runAfterNextRender(callback) {
+        window.requestAnimationFrame(() => {
+            window.requestAnimationFrame(() => {
+                callback();
+            });
+        });
+    }
+
+    function pulseLocatedElement(element) {
+        if (!(element instanceof HTMLElement)) {
+            return;
+        }
+
+        element.scrollIntoView({
+            behavior: 'smooth',
+            block: 'center',
+            inline: 'nearest'
+        });
+
+        element.classList.remove('search-located');
+        void element.offsetWidth;
+        element.classList.add('search-located');
+        window.setTimeout(() => {
+            element.classList.remove('search-located');
+        }, 1600);
+    }
+
+    function clearGlobalSearch() {
+        state.globalSearchTerm = '';
+        updateMainSearchInputValue('');
+    }
+
+    function locateFolderSearchResult(folderId) {
+        const folder = getFolderById(folderId);
+        if (!folder) {
+            return;
+        }
+
+        clearGlobalSearch();
+        expandFolderAncestors(folder.id);
+        state.currentLibraryFolderId = folder.id;
+        state.lastSaveFolder = buildFolderPath(folder.id);
+        updateSaveFolderInputValue(state.lastSaveFolder);
+        storage.set('currentLibraryFolderId', state.currentLibraryFolderId);
+        switchTab('library', true);
+
+        runAfterNextRender(() => {
+            pulseLocatedElement(findElementByDataset('.folder-node', 'folderId', folder.id));
+        });
+    }
+
+    function locateConversationSearchResult(savedId) {
+        const entry = state.savedConversations.find((saved) => saved.id === savedId);
+        if (!entry) {
+            return;
+        }
+
+        clearGlobalSearch();
+        if (entry.folderId) {
+            expandFolderAncestors(entry.folderId);
+            state.currentLibraryFolderId = entry.folderId;
+            state.lastSaveFolder = buildFolderPath(entry.folderId);
+        } else {
+            state.currentLibraryFolderId = LIBRARY_INBOX_ID;
+            state.lastSaveFolder = '';
+        }
+
+        updateSaveFolderInputValue(state.lastSaveFolder);
+        storage.set('currentLibraryFolderId', state.currentLibraryFolderId);
+        switchTab('library', true);
+
+        runAfterNextRender(() => {
+            pulseLocatedElement(findElementByDataset('.library-item, .lmnav-tree-conversation', 'savedId', entry.id));
+        });
+    }
+
+    function locatePromptSearchResult(promptId) {
+        const prompt = state.prompts.find((entry) => entry.id === promptId);
+        if (!prompt) {
+            return;
+        }
+
+        clearGlobalSearch();
+        switchTab('prompts', true);
+        setOutlineCollapsed(false);
+        setOutlinePanelTab('prompts');
+
+        runAfterNextRender(() => {
+            pulseLocatedElement(findElementByDataset('.prompt-item', 'promptId', prompt.id));
+            pulseLocatedElement(findElementByDataset('.lmnav-prompt-card', 'outlinePromptId', prompt.id));
+        });
+    }
+
+    function activateGlobalSearchResult(item) {
+        if (!(item instanceof HTMLElement)) {
+            return;
+        }
+
+        const resultId = item.dataset.resultId || '';
+        const resultType = item.dataset.searchType || '';
+        if (!resultId || !resultType) {
+            return;
+        }
+
+        if (resultType === 'folder') {
+            locateFolderSearchResult(resultId);
+            return;
+        }
+
+        if (resultType === 'conversation') {
+            locateConversationSearchResult(resultId);
+            return;
+        }
+
+        if (resultType === 'prompt') {
+            locatePromptSearchResult(resultId);
+        }
+    }
+
+    function handleGlobalSearchResultClick(event) {
+        const item = event.target.closest('.global-search-item');
+        if (!item) {
+            return;
+        }
+
+        activateGlobalSearchResult(item);
+    }
+
+    function handleGlobalSearchResultKeydown(event) {
+        if (event.key !== 'Enter' && event.key !== ' ') {
+            return;
+        }
+
+        const item = event.target.closest('.global-search-item');
+        if (!item) {
+            return;
+        }
+
+        event.preventDefault();
+        activateGlobalSearchResult(item);
     }
 
     function handlePromptClick(event) {
@@ -3664,11 +4031,29 @@
     }
 
     function deleteSavedConversation(savedId) {
-        state.savedConversations = state.savedConversations.filter((entry) => entry.id !== savedId);
-        persistLibraryState();
+        const entry = state.savedConversations.find((saved) => saved.id === savedId);
+        if (!entry) {
+            return;
+        }
+
+        const snapshot = createLibraryStateSnapshot();
+        state.savedConversations = state.savedConversations.filter((saved) => saved.id !== savedId);
         renderLibrary();
         renderTools();
-        showToast('会话已从资料库移除。');
+        showToast(
+            '已移除会话“' + core.truncate(entry.title, 24) + '”',
+            () => {
+                restoreLibraryStateSnapshot(snapshot);
+                persistLibraryState().catch((error) => {
+                    console.error(error);
+                    showToast('撤销移除会话失败。', true);
+                });
+            },
+            {
+                onExpire: () => persistLibraryState(),
+                actionText: '撤销'
+            },
+        );
     }
 
     function buildMarkdown(snapshot) {
@@ -4202,15 +4587,10 @@
         renderLibrary();
     }
 
-    async function deleteFolderById(folderId) {
+    function applyFolderDeletionInMemory(folderId) {
         const folder = getFolderById(folderId);
         if (!folder) {
-            return;
-        }
-
-        const confirmed = window.confirm('确定删除此文件夹吗？其中的会话将被移至未分类。');
-        if (!confirmed) {
-            return;
+            return null;
         }
 
         state.savedFolders.forEach((entry) => {
@@ -4232,14 +4612,44 @@
         if (state.currentLibraryFolderId === folder.id) {
             state.currentLibraryFolderId = LIBRARY_INBOX_ID;
         }
+
         state.lastSaveFolder = isRealFolderId(state.currentLibraryFolderId) ? buildFolderPath(state.currentLibraryFolderId) : '';
         updateSaveFolderInputValue(state.lastSaveFolder);
         closeFolderContextMenu();
         clearFolderEditState();
         syncFolderChildren();
-        await persistLibraryState();
         renderLibrary();
-        showToast('文件夹已删除。');
+        renderTools();
+
+        return folder;
+    }
+
+    async function deleteFolderById(folderId) {
+        const folder = getFolderById(folderId);
+        if (!folder) {
+            return;
+        }
+
+        const folderLabel = buildFolderPath(folder.id) || folder.name;
+        const snapshot = createLibraryStateSnapshot();
+        if (!applyFolderDeletionInMemory(folderId)) {
+            return;
+        }
+
+        showToast(
+            '已删除文件夹“' + folderLabel + '”',
+            () => {
+                restoreLibraryStateSnapshot(snapshot);
+                persistLibraryState().catch((error) => {
+                    console.error(error);
+                    showToast('撤销删除失败。', true);
+                });
+            },
+            {
+                onExpire: () => persistLibraryState(),
+                actionText: '撤销'
+            },
+        );
     }
 
     function handleFolderMenuAction(folderId, action) {
@@ -4445,19 +4855,100 @@
         showToast('压缩提示词已插入。');
     }
 
-    function showToast(message, isError) {
+    function normalizeToastOptions(onUndoOrOptions, optionsOrIsError) {
+        const config = {
+            duration: 4000,
+            isError: false,
+            actionText: '撤销',
+            onUndo: null,
+            onExpire: null
+        };
+
+        if (typeof onUndoOrOptions === 'function') {
+            config.onUndo = onUndoOrOptions;
+            if (typeof optionsOrIsError === 'boolean') {
+                config.isError = optionsOrIsError;
+            } else if (optionsOrIsError && typeof optionsOrIsError === 'object') {
+                Object.assign(config, optionsOrIsError);
+            }
+            return config;
+        }
+
+        if (typeof onUndoOrOptions === 'boolean') {
+            config.isError = onUndoOrOptions;
+            if (optionsOrIsError && typeof optionsOrIsError === 'object') {
+                Object.assign(config, optionsOrIsError);
+            }
+            return config;
+        }
+
+        if (onUndoOrOptions && typeof onUndoOrOptions === 'object') {
+            Object.assign(config, onUndoOrOptions);
+        }
+
+        return config;
+    }
+
+    function runToastExpireCallback(callback) {
+        if (typeof callback !== 'function') {
+            return;
+        }
+
+        Promise.resolve(callback()).catch((error) => {
+            console.error(error);
+        });
+    }
+
+    function hideToast(options) {
         if (!state.toastEl) {
             return;
         }
 
-        state.toastEl.textContent = message;
-        state.toastEl.classList.toggle('error', Boolean(isError));
+        const config = options && typeof options === 'object' ? options : {};
+        const expireCallback = config.executeExpire ? state.toastExpireCallback : null;
+
+        clearTimeout(state.toastTimer);
+        state.toastTimer = null;
+        state.toastUndoCallback = null;
+        state.toastExpireCallback = null;
+
+        state.toastEl.classList.remove('visible', 'error', 'has-action');
+        if (state.toastTextEl) {
+            state.toastTextEl.textContent = '';
+        }
+        if (state.toastUndoButtonEl) {
+            state.toastUndoButtonEl.hidden = true;
+            state.toastUndoButtonEl.textContent = '撤销';
+        }
+
+        runToastExpireCallback(expireCallback);
+    }
+
+    function showToast(message, onUndoOrOptions, optionsOrIsError) {
+        if (!state.toastEl || !state.toastTextEl || !message) {
+            return;
+        }
+
+        if (state.toastTimer || state.toastUndoCallback || state.toastExpireCallback) {
+            hideToast({ executeExpire: true });
+        }
+
+        const config = normalizeToastOptions(onUndoOrOptions, optionsOrIsError);
+        state.toastTextEl.textContent = message;
+        state.toastUndoCallback = typeof config.onUndo === 'function' ? config.onUndo : null;
+        state.toastExpireCallback = typeof config.onExpire === 'function' ? config.onExpire : null;
+        state.toastEl.classList.toggle('error', Boolean(config.isError));
+        state.toastEl.classList.toggle('has-action', Boolean(state.toastUndoCallback));
+        if (state.toastUndoButtonEl) {
+            state.toastUndoButtonEl.hidden = !state.toastUndoCallback;
+            state.toastUndoButtonEl.textContent = config.actionText || '撤销';
+        }
         state.toastEl.classList.add('visible');
 
         clearTimeout(state.toastTimer);
         state.toastTimer = window.setTimeout(() => {
-            state.toastEl.classList.remove('visible');
-        }, 2400);
+            hideToast({ executeExpire: true });
+        }, Math.max(800, Number(config.duration) || 4000));
     }
 
     function debugChatDOMStructure() {
@@ -4554,7 +5045,7 @@
         const isDebugExcluded = (node) => Boolean(
             node &&
             node.closest &&
-            node.closest('#lmarena-map-sidebar, #lmnav-outline-panel, #lmarena-hover-tooltip, #lmnav-toast'),
+            node.closest(FLOATING_UI_SELECTOR),
         );
 
         const rawNodes = Array.from(document.querySelectorAll(messageSelectors));
